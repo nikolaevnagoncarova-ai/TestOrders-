@@ -38,7 +38,6 @@ def init_db():
                 total_volume REAL DEFAULT 0.0
             )
         """)
-        # Таблица для защиты от обработки одного и того же сообщения дважды
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS processed_messages (
                 chat_id INTEGER,
@@ -69,6 +68,36 @@ def calculate_tag(current_volume: float, existing_tag: str) -> str:
         return 'Buyer'
     else:
         return 'Пользователь'
+
+# Функция автоматической выдачи админки и изменения серого префикса
+async def update_user_admin_title(chat_id: int, user_id: int, tag: str):
+    if not user_id:
+        return
+    try:
+        # 1. Назначаем пользователя администратором (минимальные права, чтобы чат не ломать)
+        await bot.promote_chat_member(
+            chat_id=chat_id,
+            user_id=user_id,
+            is_anonymous=False,
+            can_manage_chat=True,
+            can_delete_messages=False,
+            can_manage_video_chats=False,
+            can_restrict_members=False,
+            can_promote_members=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_post_messages=False,
+            can_edit_messages=False,
+            can_pin_messages=False
+        )
+        # 2. Устанавливаем серый префикс (максимум 16 символов в Telegram)
+        await bot.set_chat_administrator_custom_title(
+            chat_id=chat_id,
+            user_id=user_id,
+            custom_title=tag[:16]
+        )
+    except Exception as e:
+        print(f"Не удалось выдать префикс админа: {e}")
 
 def register_or_update_user(username: str, user_id: int = None, amount: float = 0.0):
     clean_username = username.replace("@", "").lower()
@@ -119,14 +148,12 @@ ORDER_REGEX = re.compile(r"^\+\s*(\d+(?:\.\d+)?)\$?\s*@([a-zA-Z0-9_]+)")
 
 @dp.message(F.text.regexp(ORDER_REGEX))
 async def process_order(message: types.Message):
-    # Строгая защита в БД: если это конкретное сообщение уже обрабатывалось, сразу выходим
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
         try:
             cur.execute("INSERT INTO processed_messages (chat_id, message_id) VALUES (?, ?)", (message.chat.id, message.message_id))
             conn.commit()
         except sqlite3.IntegrityError:
-            # Сообщение уже было обработано другим потоком/экземпляром бота
             return
 
     match = ORDER_REGEX.match(message.text)
@@ -136,6 +163,7 @@ async def process_order(message: types.Message):
 
     buyer_old_data = get_user(buyer_username)
     buyer_old_orders = buyer_old_data[3] if buyer_old_data else 0
+    buyer_old_tag = buyer_old_data[4] if buyer_old_data else 'Пользователь'
 
     register_or_update_user(seller_username, message.from_user.id, amount)
     register_or_update_user(buyer_username, None, amount)
@@ -158,7 +186,12 @@ async def process_order(message: types.Message):
     )
     await message.answer(receipt_text, parse_mode="HTML")
 
-    # Отправка приглашения при переходе на 3-й ордер
+    # Автоматически обновляем префикс/админку в группе, если тег изменился или появился user_id
+    if buyer_data[0]:
+        if buyer_old_tag != buyer_data[4] or buyer_old_orders == 0:
+            await update_user_admin_title(message.chat.id, buyer_data[0], buyer_data[4])
+
+    # Отправка приглашения в ЛС при переходе на 3-й ордер
     if buyer_old_orders < 3 and buyer_data[3] >= 3 and buyer_data[0]:
         try:
             welcome_text = (
@@ -203,14 +236,18 @@ async def cmd_tag(message: types.Message, command: CommandObject):
         return await message.answer("Укажите ваш новый тег. Пример:\n<code>/tag МойТег</code>", parse_mode="HTML")
     
     new_tag = command.args.strip()
-    if len(new_tag) > 20:
-        return await message.answer("❌ Тег слишком длинный. Максимум 20 символов.")
+    if len(new_tag) > 16:
+        return await message.answer("❌ Префикс слишком длинный. Максимум 16 символов для Telegram.")
     
     with sqlite3.connect(DB_FILE) as conn:
         conn.execute("UPDATE users SET tag = ? WHERE username = ?", (new_tag, username))
         conn.commit()
 
-    await message.answer(f"✅ Ваш персональный тег успешно изменен на: <b>{new_tag}</b>", parse_mode="HTML")
+    # Сразу обновляем префикс в группе
+    if user[0]:
+        await update_user_admin_title(message.chat.id, user[0], new_tag)
+
+    await message.answer(f"✅ Ваш персональный префикс успешно изменен на: <b>{new_tag}</b>", parse_mode="HTML")
 
 @dp.message(Command("me"))
 async def cmd_me(message: types.Message):
