@@ -49,14 +49,24 @@ def register_or_update_user(username: str, user_id: int = None, amount: float = 
         user = cur.fetchone()
         
         if not user:
-            cur.execute("INSERT INTO users (user_id, username, total_volume, orders_count) VALUES (?, ?, ?, ?)",
-                        (user_id, clean_username, amount, 1 if amount > 0 else 0))
+            new_volume = amount
+            # Если с первого раза купил на 5000$ и больше
+            new_tag = 'Скуп' if new_volume >= 5000 else 'Пользователь'
+            cur.execute("INSERT INTO users (user_id, username, total_volume, orders_count, tag) VALUES (?, ?, ?, ?, ?)",
+                        (user_id, clean_username, new_volume, 1 if amount > 0 else 0, new_tag))
         else:
+            new_volume = user[2] + amount
+            new_orders_count = user[3] + (1 if amount > 0 else 0)
+            
+            # Если оборот достиг 5000$, меняем тег на Скуп
+            new_tag = 'Скуп' if new_volume >= 5000 else user[4]
+            
+            cur.execute("UPDATE users SET total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
+                        (new_volume, new_orders_count, new_tag, clean_username))
+            
             if user_id and not user[0]:
                 cur.execute("UPDATE users SET user_id = ? WHERE username = ?", (user_id, clean_username))
-            if amount > 0:
-                cur.execute("UPDATE users SET total_volume = total_volume + ?, orders_count = orders_count + 1 WHERE username = ?",
-                            (amount, clean_username))
+                
         conn.commit()
 
 def get_user(username: str):
@@ -72,9 +82,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="me", description="Мой профиль"),
         BotCommand(command="info", description="Профиль пользователя"),
         BotCommand(command="stats", description="Статистика проекта"),
-        BotCommand(command="top", description="Рейтинг скупов и мерчантов"),
-        BotCommand(command="order", description="Закрыть ордер"),
-        BotCommand(command="tag", description="Выбрать свой тег"),
+        BotCommand(command="top", description="Рейтинг участников"),
         BotCommand(command="help", description="Все команды")
     ]
     await bot.set_my_commands(commands)
@@ -133,24 +141,6 @@ async def cmd_top(message: types.Message):
 
     await message.answer(text, parse_mode="HTML")
 
-@dp.message(Command("tag"))
-async def cmd_tag(message: types.Message, command: CommandObject):
-    if not command.args:
-        return await message.answer("Укажите Ваш тег (роль). Пример:\n<code>/tag Скуп</code> или <code>/tag Мерчант</code>", parse_mode="HTML")
-    
-    new_tag = command.args.strip()
-    username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
-    
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("UPDATE users SET tag = ? WHERE username = ?", (new_tag, username))
-        conn.commit()
-
-    await message.answer(f"✅ Ваш тег обновлен на: <b>{new_tag}</b>", parse_mode="HTML")
-
-@dp.message(Command("order"))
-async def cmd_order_help(message: types.Message):
-    await message.answer("Чтобы закрыть ордер, отправьте сообщение формата:\n<code>+10$ @username</code>", parse_mode="HTML")
-
 @dp.message(Command("me"))
 async def cmd_me(message: types.Message):
     username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
@@ -198,7 +188,6 @@ async def cmd_stats(message: types.Message):
     text = f"🌐 <b>Статистика проекта:</b>\n📝 Всего закрыто ордеров: <b>{st[0]}</b>\n💰 Общий оборот: <b>{st[1]}$</b>"
     await message.answer(text, parse_mode="HTML")
 
-# ИСПРАВЛЕНО: Добавлен отсутствовавший декоратор @dp.message(Command("help"))
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     text = (
@@ -206,9 +195,8 @@ async def cmd_help(message: types.Message):
         "/top — Топ лидеров\n"
         "/me — Личный профиль\n"
         "/info @username — Посмотреть профиль\n"
-        "/tag <роль> — Установить себе роль (например: Скуп)\n"
-        "/stats — Общий оборот\n\n"
-        "Формат ордера: <code>+10$ @username</code>"
+        "/stats — Общий оборот проекта\n\n"
+        "Формат закрытия ордера: <code>+10$ @username</code>"
     )
     await message.answer(text, parse_mode="HTML")
 
