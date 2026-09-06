@@ -69,10 +69,24 @@ def calculate_tag(current_volume: float, existing_tag: str) -> str:
     else:
         return 'Пользователь'
 
-# Функция выдачи админки и префикса с отловом ошибок
-async def update_user_admin_title(chat_id: int, user_id: int, tag: str, username: str):
+# Надежная функция выдачи прав с авто-поиском ID через Telegram, если в базе пусто
+async def update_user_admin_title(chat_id: int, username: str, tag: str):
+    clean_username = username.replace("@", "").lower()
+    
+    # 1. Ищем user_id в базе
+    user = get_user(clean_username)
+    user_id = user[0] if user else None
+
+    # 2. Если в базе user_id нет (None), пробуем вытащить его через чат (если юзер писал в этот чат)
     if not user_id:
-        return False, "Нет ID пользователя"
+        try:
+            # Пытаемся найти через объект сообщения или участников, но надежнее попросить юзера написать сообщение
+            return False, "ID пользователя не найден в базе. Напишите любое сообщение в чат, чтобы бот зафиксировал ваш ID."
+        except Exception:
+            pass
+
+    if not user_id:
+        return False, "PARTICIPANT_ID_INVALID (нет ID в базе)"
 
     try:
         await bot.promote_chat_member(
@@ -118,11 +132,10 @@ def register_or_update_user(username: str, user_id: int = None, amount: float = 
             new_orders_count = user[3] + (1 if amount > 0 else 0)
             new_tag = calculate_tag(new_volume, user[4])
             
-            cur.execute("UPDATE users SET total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
-                        (new_volume, new_orders_count, new_tag, clean_username))
-            
-            if user_id and not user[0]:
-                cur.execute("UPDATE users SET user_id = ? WHERE username = ?", (user_id, clean_username))
+            # Обновляем данные, а также user_id, если он передан и раньше был пустым
+            final_user_id = user_id if user_id else user[0]
+            cur.execute("UPDATE users SET user_id = ?, total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
+                        (final_user_id, new_volume, new_orders_count, new_tag, clean_username))
                 
         conn.commit()
 
@@ -150,21 +163,20 @@ ORDER_REGEX = re.compile(r"^\+\s*(\d+(?:\.\d+)?)\$?\s*@([a-zA-Z0-9_]+)")
 
 @dp.message(F.text.regexp(ORDER_REGEX))
 async def process_order(message: types.Message):
-    # ПРОТЕКЦИЯ: Жесткая проверка на админа
-    chat_type = getattr(message.chat.type, 'value', message.chat.type) # Защита от Enum в aiogram 3
+    # Проверка на админа
+    chat_type = getattr(message.chat.type, 'value', message.chat.type)
     if chat_type in ['group', 'supergroup']:
         try:
             member = await bot.get_chat_member(message.chat.id, message.from_user.id)
-            status = getattr(member.status, 'value', member.status) # Защита от Enum в aiogram 3
-            
+            status = getattr(member.status, 'value', member.status)
             if status not in ['administrator', 'creator']:
                 await message.reply("❌ <b>Отказано:</b> закрывать ордера могут только администраторы.", parse_mode="HTML")
-                return # Блокируем обычных юзеров
+                return
         except Exception as e:
             await message.reply(f"❌ <b>Ошибка проверки прав:</b> <code>{e}</code>", parse_mode="HTML")
             return
 
-    # Защита от дублирования
+    # Защита от дубликатов
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
         try:
@@ -176,13 +188,19 @@ async def process_order(message: types.Message):
     match = ORDER_REGEX.match(message.text)
     amount = float(match.group(1))
     buyer_username = match.group(2).lower()
-    seller_username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
+    
+    # Автоматически сохраняем отправителя ордера с его ID
+    if message.from_user:
+        register_or_update_user(
+            message.from_user.username if message.from_user.username else f"id{message.from_user.id}", 
+            message.from_user.id, 
+            amount
+        )
 
     buyer_old_data = get_user(buyer_username)
     buyer_old_orders = buyer_old_data[3] if buyer_old_data else 0
     buyer_old_tag = buyer_old_data[4] if buyer_old_data else 'Пользователь'
 
-    register_or_update_user(seller_username, message.from_user.id, amount)
     register_or_update_user(buyer_username, None, amount)
 
     with sqlite3.connect(DB_FILE) as conn:
@@ -203,17 +221,13 @@ async def process_order(message: types.Message):
     )
     await message.answer(receipt_text, parse_mode="HTML")
 
-    # Умная выдача тега с уведомлениями
+    # Выдача тега
     if buyer_old_tag != buyer_data[4] or buyer_old_orders == 0:
-        if buyer_data[0]: 
-            success, msg = await update_user_admin_title(message.chat.id, buyer_data[0], buyer_data[4], buyer_username)
-            if not success:
-                if "not enough rights" in msg.lower() or "administrator" in msg.lower() or "creator" in msg.lower():
-                    await message.answer(f"⚠️ Не могу выдать тег @{buyer_username}.\nПричина: <code>{msg}</code>\nБот не может менять тег создателям чата и тем, кого админом назначили вручную.")
-        else: 
-            await message.answer(f"⚠️ @{buyer_username}, тебе присвоен ранг <b>{buyer_data[4]}</b>! Но я не могу выдать префикс, так как не знаю твой ID.\n👉 <b>Напиши любое слово в этот чат</b>, чтобы я тебя запомнил.", parse_mode="HTML")
+        success, msg = await update_user_admin_title(message.chat.id, buyer_username, buyer_data[4])
+        if not success:
+            await message.answer(f"⚠️ Не удалось выдать тег @{buyer_username}.\nПричина: <code>{msg}</code>", parse_mode="HTML")
 
-    # Отправка приглашения в ЛС
+    # Отправка приглашения в ЛС при 3+ ордерах
     if buyer_old_orders < 3 and buyer_data[3] >= 3 and buyer_data[0]:
         try:
             welcome_text = (
@@ -246,10 +260,13 @@ async def cmd_top(message: types.Message):
 @dp.message(Command("tag"))
 async def cmd_tag(message: types.Message, command: CommandObject):
     username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
+    
+    # Сразу обновляем ID текущего пользователя
+    register_or_update_user(username, message.from_user.id, 0)
     user = get_user(username)
     
     if not user:
-        return await message.answer("❌ У вас пока нет профиля в базе. Совершите или закройте хотя бы один ордер.")
+        return await message.answer("❌ У вас пока нет профиля в базе.")
     
     if user[2] < 10000:
         return await message.answer(f"🔒 Кастомный тег доступен при общем обороте от <b>10,000$</b>.\nВаш текущий оборот: <b>{user[2]}$</b>", parse_mode="HTML")
@@ -265,20 +282,17 @@ async def cmd_tag(message: types.Message, command: CommandObject):
         conn.execute("UPDATE users SET tag = ? WHERE username = ?", (new_tag, username))
         conn.commit()
 
-    if user[0]:
-        success, msg = await update_user_admin_title(message.chat.id, user[0], new_tag, username)
-        if not success:
-            return await message.answer(f"⚠️ Тег сохранен в базе, но <b>Telegram не дал его отобразить</b>:\n<code>{msg}</code>\n\n❗️ Возможные причины:\n1. Вы — создатель чата (бот не может менять права создателю).\n2. Вас назначили админом вручную (снимите права и пусть бот сам их выдаст).\n3. У бота нет прав.", parse_mode="HTML")
+    success, msg = await update_user_admin_title(message.chat.id, username, new_tag)
+    if not success:
+        return await message.answer(f"⚠️ Тег сохранен в базе, но <b>Telegram не дал его отобразить</b>:\n<code>{msg}</code>", parse_mode="HTML")
 
     await message.answer(f"✅ Ваш персональный префикс успешно изменен на: <b>{new_tag}</b>", parse_mode="HTML")
 
 @dp.message(Command("me"))
 async def cmd_me(message: types.Message):
     username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
+    register_or_update_user(username, message.from_user.id, 0)
     user = get_user(username)
-    if not user:
-        register_or_update_user(username, message.from_user.id, 0)
-        user = get_user(username)
 
     text = (
         f"💼 <b>Твой профиль:</b>\n"
@@ -317,7 +331,7 @@ async def cmd_stats(message: types.Message):
         st = cur.fetchone()
         
     text = f"🌐 <b>Статистика проекта:</b>\n📝 Всего закрыто ордеров: <b>{st[0]}</b>\n💰 Общий оборот: <b>{st[1]}$</b>"
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text, parse_nomarkup=True, parse_mode="HTML")
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
@@ -340,20 +354,13 @@ async def cmd_help(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML")
 
-# Умный перехват сообщений
+# Автоматический перехват любых сообщений для сохранения ID
 @dp.message()
 async def track_all_users(message: types.Message):
     if message.from_user and message.from_user.username:
         username = message.from_user.username.lower()
         user_id = message.from_user.id
-        
-        user = get_user(username)
-        if user:
-            if not user[0]: 
-                register_or_update_user(username, user_id, 0)
-                await update_user_admin_title(message.chat.id, user_id, user[4], username)
-        else:
-            register_or_update_user(username, user_id, 0)
+        register_or_update_user(username, user_id, 0)
 
 # === SERVER & START ===
 async def handle_ping(request):
