@@ -69,45 +69,20 @@ def calculate_tag(current_volume: float, existing_tag: str) -> str:
     else:
         return 'Пользователь'
 
-# Надежная функция выдачи прав с авто-поиском ID через Telegram, если в базе пусто
-async def update_user_admin_title(chat_id: int, username: str, tag: str):
+# Выдача именно тега участника через set_chat_member_tag
+async def update_user_member_tag(chat_id: int, username: str, tag: str):
     clean_username = username.replace("@", "").lower()
-    
-    # 1. Ищем user_id в базе
     user = get_user(clean_username)
     user_id = user[0] if user else None
 
-    # 2. Если в базе user_id нет (None), пробуем вытащить его через чат (если юзер писал в этот чат)
     if not user_id:
-        try:
-            # Пытаемся найти через объект сообщения или участников, но надежнее попросить юзера написать сообщение
-            return False, "ID пользователя не найден в базе. Напишите любое сообщение в чат, чтобы бот зафиксировал ваш ID."
-        except Exception:
-            pass
-
-    if not user_id:
-        return False, "PARTICIPANT_ID_INVALID (нет ID в базе)"
+        return False, "ID пользователя не найден в базе. Напишите любое сообщение в чат."
 
     try:
-        await bot.promote_chat_member(
+        await bot.set_chat_member_tag(
             chat_id=chat_id,
             user_id=user_id,
-            is_anonymous=False,
-            can_manage_chat=True,
-            can_delete_messages=False,
-            can_manage_video_chats=False,
-            can_restrict_members=False,
-            can_promote_members=False,
-            can_change_info=False,
-            can_invite_users=False,
-            can_post_messages=False,
-            can_edit_messages=False,
-            can_pin_messages=False
-        )
-        await bot.set_chat_administrator_custom_title(
-            chat_id=chat_id,
-            user_id=user_id,
-            custom_title=tag[:16]
+            tag=tag[:16]
         )
         return True, "OK"
     except TelegramAPIError as e:
@@ -132,7 +107,6 @@ def register_or_update_user(username: str, user_id: int = None, amount: float = 
             new_orders_count = user[3] + (1 if amount > 0 else 0)
             new_tag = calculate_tag(new_volume, user[4])
             
-            # Обновляем данные, а также user_id, если он передан и раньше был пустым
             final_user_id = user_id if user_id else user[0]
             cur.execute("UPDATE users SET user_id = ?, total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
                         (final_user_id, new_volume, new_orders_count, new_tag, clean_username))
@@ -163,7 +137,6 @@ ORDER_REGEX = re.compile(r"^\+\s*(\d+(?:\.\d+)?)\$?\s*@([a-zA-Z0-9_]+)")
 
 @dp.message(F.text.regexp(ORDER_REGEX))
 async def process_order(message: types.Message):
-    # Проверка на админа
     chat_type = getattr(message.chat.type, 'value', message.chat.type)
     if chat_type in ['group', 'supergroup']:
         try:
@@ -176,7 +149,6 @@ async def process_order(message: types.Message):
             await message.reply(f"❌ <b>Ошибка проверки прав:</b> <code>{e}</code>", parse_mode="HTML")
             return
 
-    # Защита от дубликатов
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
         try:
@@ -189,7 +161,6 @@ async def process_order(message: types.Message):
     amount = float(match.group(1))
     buyer_username = match.group(2).lower()
     
-    # Автоматически сохраняем отправителя ордера с его ID
     if message.from_user:
         register_or_update_user(
             message.from_user.username if message.from_user.username else f"id{message.from_user.id}", 
@@ -221,13 +192,11 @@ async def process_order(message: types.Message):
     )
     await message.answer(receipt_text, parse_mode="HTML")
 
-    # Выдача тега
     if buyer_old_tag != buyer_data[4] or buyer_old_orders == 0:
-        success, msg = await update_user_admin_title(message.chat.id, buyer_username, buyer_data[4])
+        success, msg = await update_user_member_tag(message.chat.id, buyer_username, buyer_data[4])
         if not success:
             await message.answer(f"⚠️ Не удалось выдать тег @{buyer_username}.\nПричина: <code>{msg}</code>", parse_mode="HTML")
 
-    # Отправка приглашения в ЛС при 3+ ордерах
     if buyer_old_orders < 3 and buyer_data[3] >= 3 and buyer_data[0]:
         try:
             welcome_text = (
@@ -261,7 +230,6 @@ async def cmd_top(message: types.Message):
 async def cmd_tag(message: types.Message, command: CommandObject):
     username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
     
-    # Сразу обновляем ID текущего пользователя
     register_or_update_user(username, message.from_user.id, 0)
     user = get_user(username)
     
@@ -282,7 +250,7 @@ async def cmd_tag(message: types.Message, command: CommandObject):
         conn.execute("UPDATE users SET tag = ? WHERE username = ?", (new_tag, username))
         conn.commit()
 
-    success, msg = await update_user_admin_title(message.chat.id, username, new_tag)
+    success, msg = await update_user_member_tag(message.chat.id, username, new_tag)
     if not success:
         return await message.answer(f"⚠️ Тег сохранен в базе, но <b>Telegram не дал его отобразить</b>:\n<code>{msg}</code>", parse_mode="HTML")
 
@@ -331,7 +299,7 @@ async def cmd_stats(message: types.Message):
         st = cur.fetchone()
         
     text = f"🌐 <b>Статистика проекта:</b>\n📝 Всего закрыто ордеров: <b>{st[0]}</b>\n💰 Общий оборот: <b>{st[1]}$</b>"
-    await message.answer(text, parse_nomarkup=True, parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
@@ -354,7 +322,6 @@ async def cmd_help(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML")
 
-# Автоматический перехват любых сообщений для сохранения ID
 @dp.message()
 async def track_all_users(message: types.Message):
     if message.from_user and message.from_user.username:
