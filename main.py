@@ -22,16 +22,15 @@ dp = Dispatcher()
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        # Таблица пользователей
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT UNIQUE,
+                tag TEXT DEFAULT 'Пользователь',
                 total_volume REAL DEFAULT 0.0,
                 orders_count INTEGER DEFAULT 0
             )
         """)
-        # Таблица глобальной статистики
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS stats (
                 id INTEGER PRIMARY KEY DEFAULT 1,
@@ -42,50 +41,45 @@ def init_db():
         cursor.execute("INSERT OR IGNORE INTO stats (id) VALUES (1)")
         conn.commit()
 
-# Хелперы для БД
-def get_or_create_user(username: str, user_id: int = None):
+def register_or_update_user(username: str, user_id: int = None, amount: float = 0.0):
     clean_username = username.replace("@", "").lower()
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
-        cur.execute("SELECT user_id, username, total_volume, orders_count FROM users WHERE username = ?", (clean_username,))
+        cur.execute("SELECT user_id, username, total_volume, orders_count, tag FROM users WHERE username = ?", (clean_username,))
         user = cur.fetchone()
         
-        if not user and user_id:
-            cur.execute("INSERT INTO users (user_id, username) VALUES (?, ?)", (user_id, clean_username))
-            conn.commit()
-            return (user_id, clean_username, 0.0, 0)
-        return user
+        if not user:
+            cur.execute("INSERT INTO users (user_id, username, total_volume, orders_count) VALUES (?, ?, ?, ?)",
+                        (user_id, clean_username, amount, 1 if amount > 0 else 0))
+        else:
+            if user_id and not user[0]:
+                cur.execute("UPDATE users SET user_id = ? WHERE username = ?", (user_id, clean_username))
+            if amount > 0:
+                cur.execute("UPDATE users SET total_volume = total_volume + ?, orders_count = orders_count + 1 WHERE username = ?",
+                            (amount, clean_username))
+        conn.commit()
 
-def update_order_stats(username: str, amount: float):
+def get_user(username: str):
     clean_username = username.replace("@", "").lower()
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
-        # Обновляем юзера
-        cur.execute("UPDATE users SET total_volume = total_volume + ?, orders_count = orders_count + 1 WHERE username = ?", (amount, clean_username))
-        # Обновляем глобальную стату
-        cur.execute("UPDATE stats SET total_orders = total_orders + 1, total_volume = total_volume + ? WHERE id = 1", (amount,))
-        
-        cur.execute("SELECT total_volume, orders_count, user_id FROM users WHERE username = ?", (clean_username,))
-        user_stats = cur.fetchone()
-        
-        cur.execute("SELECT total_orders FROM stats WHERE id = 1")
-        global_order_id = cur.fetchone()[0]
-        conn.commit()
-        
-        return user_stats, global_order_id
+        cur.execute("SELECT user_id, username, total_volume, orders_count, tag FROM users WHERE username = ?", (clean_username,))
+        return cur.fetchone()
 
-# === УСТАНОВКА КОМАНД МЕНЮ ===
+# === КОМАНДЫ МЕНЮ ===
 async def set_bot_commands(bot: Bot):
     commands = [
         BotCommand(command="me", description="Мой профиль"),
         BotCommand(command="info", description="Профиль пользователя"),
         BotCommand(command="stats", description="Статистика проекта"),
+        BotCommand(command="top", description="Рейтинг скупов и мерчантов"),
+        BotCommand(command="order", description="Закрыть ордер"),
+        BotCommand(command="tag", description="Выбрать свой тег"),
         BotCommand(command="help", description="Все команды")
     ]
     await bot.set_my_commands(commands)
 
-# === ЛОГИКА ЗАКРЫТИЯ ОРДЕРА ===
-# Регулярное выражение ловит: +10$ @username, + 32$ @username, +11.5 @username
+# === ОБРАБОТКА ОРДЕРА ===
 ORDER_REGEX = re.compile(r"^\+\s*(\d+(?:\.\d+)?)\$?\s*@([a-zA-Z0-9_]+)")
 
 @dp.message(F.text.regexp(ORDER_REGEX))
@@ -93,70 +87,108 @@ async def process_order(message: types.Message):
     match = ORDER_REGEX.match(message.text)
     amount = float(match.group(1))
     buyer_username = match.group(2).lower()
-    
-    # Пытаемся найти покупателя в базе
-    user_data = get_or_create_user(buyer_username)
-    if not user_data:
-        # Если юзер ни разу не писал в чат и его нет в базе, создаем заглушку
-        with sqlite3.connect(DB_FILE) as conn:
-            conn.execute("INSERT INTO users (username) VALUES (?)", (buyer_username,))
-            conn.commit()
-    
-    # Обновляем цифры
-    user_stats, global_order_id = update_order_stats(buyer_username, amount)
-    new_volume, orders_count, buyer_user_id = user_stats
-    
-    # Формируем красивый чек
+    seller_username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
+
+    # Засчитываем оборот ОБИМ участникам сделки
+    register_or_update_user(seller_username, message.from_user.id, amount)
+    register_or_update_user(buyer_username, None, amount)
+
+    # Обновляем глобальную статистику
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE stats SET total_orders = total_orders + 1, total_volume = total_volume + ? WHERE id = 1", (amount,))
+        cur.execute("SELECT total_orders FROM stats WHERE id = 1")
+        global_order_id = cur.fetchone()[0]
+        conn.commit()
+
+    buyer_data = get_user(buyer_username)
+
     receipt_text = (
         f"<b>[PAY] <u>ОРДЕР ЗАКРЫТ</u></b>\n\n"
-        f"📝 Ордер · <b>#{global_order_id + 5000}</b>\n" # +5000 для красоты старта
+        f"📝 Ордер · <b>#{global_order_id + 5000}</b>\n"
         f"👤 Скуп · @{buyer_username}\n"
         f"💸 Сумма · <b>{amount}$</b>\n"
-        f"📈 Итого · <b>{orders_count}</b> · <b>{new_volume}$</b>"
+        f"📈 Итого скупа · <b>{buyer_data[3]}</b> · <b>{buyer_data[2]}$</b>"
     )
-    
     await message.answer(receipt_text, parse_mode="HTML")
-    
-    # Логика приглашения в основной чат (если это 3-й ордер)
-    if orders_count == 3 and buyer_user_id:
-        invite_text = (
-            f"🎉 Поздравляем! Вы успешно закрыли 3 ордера.\n"
-            f"Добро пожаловать в наш основной чат: {MAIN_CHAT_LINK}"
-        )
-        try:
-            await bot.send_message(chat_id=buyer_user_id, text=invite_text)
-        except TelegramAPIError:
-            logging.info(f"Не удалось отправить ЛС пользователю @{buyer_username}. Возможно, он не запускал бота.")
 
-# === КОМАНДЫ ===
+    # Авто-приглашение на 3-й ордер
+    if buyer_data[3] == 3 and buyer_data[0]:
+        try:
+            await bot.send_message(chat_id=buyer_data[0], text=f"🎉 Вы закрыли 3 ордера! Наш основной чат: {MAIN_CHAT_LINK}")
+        except TelegramAPIError:
+            pass
+
+# === ДОПОЛНИТЕЛЬНЫЕ КОМАНДЫ ===
+@dp.message(Command("top"))
+async def cmd_top(message: types.Message):
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT username, total_volume, orders_count, tag FROM users ORDER BY total_volume DESC LIMIT 10")
+        leaders = cur.fetchall()
+
+    if not leaders:
+        return await message.answer("🏆 Рейтинг пока пуст.")
+
+    text = "🏆 <b>Топ участников по обороту:</b>\n\n"
+    for i, u in enumerate(leaders, 1):
+        text += f"{i}. @{u[0]} ({u[3]}) — <b>{u[1]}$</b> [{u[2]} орд.]\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("tag"))
+async def cmd_tag(message: types.Message, command: CommandObject):
+    if not command.args:
+        return await message.answer("Укажите Ваш тег (роль). Пример:\n<code>/tag Скуп</code> или <code>/tag Мерчант</code>", parse_mode="HTML")
+    
+    new_tag = command.args.strip()
+    username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
+    
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE users SET tag = ? WHERE username = ?", (new_tag, username))
+        conn.commit()
+
+    await message.answer(f"✅ Ваш тег обновлен на: <b>{new_tag}</b>", parse_mode="HTML")
+
+@dp.message(Command("order"))
+async def cmd_order_help(message: types.Message):
+    await message.answer("Чтобы закрыть ордер, отправьте сообщение формата:\n<code>+10$ @username</code>", parse_mode="HTML")
+
 @dp.message(Command("me"))
 async def cmd_me(message: types.Message):
-    user_data = get_or_create_user(message.from_user.username, message.from_user.id)
+    username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
+    user = get_user(username)
+    if not user:
+        register_or_update_user(username, message.from_user.id, 0)
+        user = get_user(username)
+
     text = (
         f"💼 <b>Твой профиль:</b>\n"
-        f"👤 Участник: @{message.from_user.username}\n"
-        f"📊 Закрыто ордеров: <b>{user_data[3]}</b>\n"
-        f"💸 Общий оборот: <b>{user_data[2]}$</b>"
+        f"👤 Участник: @{user[1]}\n"
+        f"🏷 Роль: <b>{user[4]}</b>\n"
+        f"📊 Закрыто ордеров: <b>{user[3]}</b>\n"
+        f"💸 Общий оборот: <b>{user[2]}$</b>"
     )
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("info"))
 async def cmd_info(message: types.Message, command: CommandObject):
     if not command.args:
-        return await message.answer("Укажите юзернейм. Пример: <code>/info @username</code>", parse_mode="HTML")
+        return await message.answer("Пример: <code>/info @username</code>", parse_mode="HTML")
     
     target_username = command.args.replace("@", "").lower()
-    user_data = get_or_create_user(target_username)
+    user = get_user(target_username)
     
-    if user_data:
+    if user:
         text = (
             f"🔍 <b>Профиль пользователя:</b>\n"
-            f"👤 Участник: @{target_username}\n"
-            f"📊 Закрыто ордеров: <b>{user_data[3]}</b>\n"
-            f"💸 Общий оборот: <b>{user_data[2]}$</b>"
+            f"👤 Участник: @{user[1]}\n"
+            f"🏷 Роль: <b>{user[4]}</b>\n"
+            f"📊 Закрыто ордеров: <b>{user[3]}</b>\n"
+            f"💸 Общий оборот: <b>{user[2]}$</b>"
         )
     else:
-        text = "🤷‍♂️ Пользователь не найден в базе."
+        text = "🤷‍♂️ Пользователь не найден."
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("stats"))
@@ -164,37 +196,32 @@ async def cmd_stats(message: types.Message):
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
         cur.execute("SELECT total_orders, total_volume FROM stats WHERE id = 1")
-        global_stats = cur.fetchone()
+        st = cur.fetchone()
         
-    text = (
-        f"🌐 <b>Статистика проекта:</b>\n"
-        f"📝 Всего закрыто ордеров: <b>{global_stats[0]}</b>\n"
-        f"💰 Общий оборот: <b>{global_stats[1]}$</b>"
-    )
+    text = f"🌐 <b>Статистика проекта:</b>\n📝 Всего закрыто ордеров: <b>{st[0]}</b>\n💰 Общий оборот: <b>{st[1]}$</b>"
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     text = (
-        "<b>Доступные команды:</b>\n"
-        "/me - Посмотреть свой профиль\n"
-        "/info @username - Профиль другого участника\n"
-        "/stats - Общая статистика проекта\n\n"
-        "<i>Для закрытия ордера отправьте:</i>\n"
-        "<code>+10$ @username</code>"
+        "<b>Команды бота:</b>\n"
+        "/top — Топ лидеров\n"
+        "/me — Личный профиль\n"
+        "/info @username — Посмотреть профиль\n"
+        "/tag <роль> — Установить себе роль (например: Скуп)\n"
+        "/stats — Общий оборот\n\n"
+        "Формат ордера: <code>+10$ @username</code>"
     )
     await message.answer(text, parse_mode="HTML")
 
-# === ФОНОВЫЙ ТРЕКИНГ ПОЛЬЗОВАТЕЛЕЙ ===
-# Сохраняем user_id всех, кто пишет в чат, чтобы бот мог потом написать им в ЛС
 @dp.message()
 async def track_all_users(message: types.Message):
     if message.from_user and message.from_user.username:
-        get_or_create_user(message.from_user.username, message.from_user.id)
+        register_or_update_user(message.from_user.username, message.from_user.id, 0)
 
-# === WEB-SERVER (ДЛЯ RENDER) ===
+# === SERVER & START ===
 async def handle_ping(request):
-    return web.Response(text="P2P Bot is running.")
+    return web.Response(text="OK")
 
 async def start_web_server():
     app = web.Application()
@@ -204,18 +231,12 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-# === ЗАПУСК ===
 async def main():
     logging.basicConfig(level=logging.INFO)
     init_db()
     await set_bot_commands(bot)
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Запускаем веб-сервер и пуллинг одновременно
-    await asyncio.gather(
-        start_web_server(),
-        dp.start_polling(bot, handle_as_tasks=True)
-    )
+    await asyncio.gather(start_web_server(), dp.start_polling(bot, handle_as_tasks=True))
 
 if __name__ == "__main__":
     asyncio.run(main())
