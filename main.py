@@ -41,6 +41,33 @@ def init_db():
         cursor.execute("INSERT OR IGNORE INTO stats (id) VALUES (1)")
         conn.commit()
 
+# Функция автоматического определения тега по обороту
+def calculate_tag(current_volume: float, existing_tag: str) -> str:
+    # Если у пользователя уже установлен кастомный тег (при достижении 10k+) и оборот всё ещё >= 10000, 
+    # оставляем его кастомный тег, если он сам его менял, либо оцениваем по порогам.
+    # Простые пороги:
+    if current_volume >= 10000:
+        # Если это стандартный тег из списка или 'Пользователь', переводим на Legend buyer, 
+        # но даем возможность сменить через /tag. Если уже стоял какой-то свой — не сбрасываем.
+        standard_tags = ['Пользователь', 'Buyer', 'Big buyer', 'Premium buyer', 'Elite buyer', 'Vip buyer', 'Legend buyer']
+        if existing_tag in standard_tags:
+            return 'Legend buyer'
+        return existing_tag
+    elif current_volume >= 5000:
+        return 'Legend buyer'
+    elif current_volume >= 3000:
+        return 'Vip buyer'
+    elif current_volume >= 1000:
+        return 'Elite buyer'
+    elif current_volume >= 500:
+        return 'Premium buyer'
+    elif current_volume >= 250:
+        return 'Big buyer'
+    elif current_volume >= 100:
+        return 'Buyer'
+    else:
+        return 'Пользователь'
+
 def register_or_update_user(username: str, user_id: int = None, amount: float = 0.0):
     clean_username = username.replace("@", "").lower()
     with sqlite3.connect(DB_FILE) as conn:
@@ -50,16 +77,15 @@ def register_or_update_user(username: str, user_id: int = None, amount: float = 
         
         if not user:
             new_volume = amount
-            # Если с первого раза купил на 5000$ и больше
-            new_tag = 'Скуп' if new_volume >= 5000 else 'Пользователь'
+            new_tag = calculate_tag(new_volume, 'Пользователь')
             cur.execute("INSERT INTO users (user_id, username, total_volume, orders_count, tag) VALUES (?, ?, ?, ?, ?)",
                         (user_id, clean_username, new_volume, 1 if amount > 0 else 0, new_tag))
         else:
             new_volume = user[2] + amount
             new_orders_count = user[3] + (1 if amount > 0 else 0)
             
-            # Если оборот достиг 5000$, меняем тег на Скуп
-            new_tag = 'Скуп' if new_volume >= 5000 else user[4]
+            # Вычисляем новый тег с учетом текущего
+            new_tag = calculate_tag(new_volume, user[4])
             
             cur.execute("UPDATE users SET total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
                         (new_volume, new_orders_count, new_tag, clean_username))
@@ -83,6 +109,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="info", description="Профиль пользователя"),
         BotCommand(command="stats", description="Статистика проекта"),
         BotCommand(command="top", description="Рейтинг участников"),
+        BotCommand(command="tag", description="Установить свой тег (от 10k$)"),
         BotCommand(command="help", description="Все команды")
     ]
     await bot.set_my_commands(commands)
@@ -137,9 +164,34 @@ async def cmd_top(message: types.Message):
 
     text = "🏆 <b>Топ участников по обороту:</b>\n\n"
     for i, u in enumerate(leaders, 1):
-        text += f"{i}. @{u[0]} ({u[3]}) — <b>{u[1]}$</b> [{u[2]} орд.]\n"
+        text += f"{i}. @{u[0]} [{u[3]}] — <b>{u[1]}$</b> ({u[2]} орд.)\n"
 
     await message.answer(text, parse_mode="HTML")
+
+@dp.message(Command("tag"))
+async def cmd_tag(message: types.Message, command: CommandObject):
+    username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
+    user = get_user(username)
+    
+    if not user:
+        return await message.answer("❌ У вас пока нет профиля в базе. Совершите или закройте хотя бы один ордер.")
+    
+    # Проверка на достижение 10,000$ оборота
+    if user[2] < 10000:
+        return await message.answer(f"🔒 Кастомный тег доступен при общем обороте от <b>10,000$</b>.\nВаш текущий оборот: <b>{user[2]}$</b>", parse_mode="HTML")
+    
+    if not command.args:
+        return await message.answer("Укажите ваш новый тег. Пример:\n<code>/tag МойТег</code>", parse_mode="HTML")
+    
+    new_tag = command.args.strip()
+    if len(new_tag) > 20:
+        return await message.answer("❌ Тег слишком длинный. Максимум 20 символов.")
+    
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("UPDATE users SET tag = ? WHERE username = ?", (new_tag, username))
+        conn.commit()
+
+    await message.answer(f"✅ Ваш персональный тег успешно изменен на: <b>{new_tag}</b>", parse_mode="HTML")
 
 @dp.message(Command("me"))
 async def cmd_me(message: types.Message):
@@ -152,7 +204,7 @@ async def cmd_me(message: types.Message):
     text = (
         f"💼 <b>Твой профиль:</b>\n"
         f"👤 Участник: @{user[1]}\n"
-        f"🏷 Роль: <b>{user[4]}</b>\n"
+        f"🏷 Тег: <b>{user[4]}</b>\n"
         f"📊 Закрыто ордеров: <b>{user[3]}</b>\n"
         f"💸 Общий оборот: <b>{user[2]}$</b>"
     )
@@ -170,7 +222,7 @@ async def cmd_info(message: types.Message, command: CommandObject):
         text = (
             f"🔍 <b>Профиль пользователя:</b>\n"
             f"👤 Участник: @{user[1]}\n"
-            f"🏷 Роль: <b>{user[4]}</b>\n"
+            f"🏷 Тег: <b>{user[4]}</b>\n"
             f"📊 Закрыто ордеров: <b>{user[3]}</b>\n"
             f"💸 Общий оборот: <b>{user[2]}$</b>"
         )
@@ -191,10 +243,19 @@ async def cmd_stats(message: types.Message):
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     text = (
-        "<b>Команды бота:</b>\n"
+        "<b>📋 Уровни тегов по обороту:</b>\n"
+        "• Buyer — от 100$\n"
+        "• Big buyer — от 250$\n"
+        "• Premium buyer — от 500$\n"
+        "• Elite buyer — от 1k$\n"
+        "• Vip buyer — от 3k$\n"
+        "• Legend buyer — от 5k$\n"
+        "• <b>от 10k$ — свой собственный тег через команду /tag</b>\n\n"
+        "<b>Команды:</b>\n"
         "/top — Топ лидеров\n"
         "/me — Личный профиль\n"
         "/info @username — Посмотреть профиль\n"
+        "/tag <тег> — Указать свой тег (доступно от 10k$)\n"
         "/stats — Общий оборот проекта\n\n"
         "Формат закрытия ордера: <code>+10$ @username</code>"
     )
