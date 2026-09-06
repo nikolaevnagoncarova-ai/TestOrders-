@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramAPIError
 
 # === НАСТРОЙКИ ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-MAIN_CHAT_LINK = os.getenv("MAIN_CHAT_LINK", "https://t.me/твоя_ссылка")
+MAIN_CHAT_LINK = "https://t.me/+q1ipzXuMbYczMDBi"
 PORT = int(os.getenv("PORT", 8080))
 DB_FILE = "p2p_orders.db"
 
@@ -43,12 +43,7 @@ def init_db():
 
 # Функция автоматического определения тега по обороту
 def calculate_tag(current_volume: float, existing_tag: str) -> str:
-    # Если у пользователя уже установлен кастомный тег (при достижении 10k+) и оборот всё ещё >= 10000, 
-    # оставляем его кастомный тег, если он сам его менял, либо оцениваем по порогам.
-    # Простые пороги:
     if current_volume >= 10000:
-        # Если это стандартный тег из списка или 'Пользователь', переводим на Legend buyer, 
-        # но даем возможность сменить через /tag. Если уже стоял какой-то свой — не сбрасываем.
         standard_tags = ['Пользователь', 'Buyer', 'Big buyer', 'Premium buyer', 'Elite buyer', 'Vip buyer', 'Legend buyer']
         if existing_tag in standard_tags:
             return 'Legend buyer'
@@ -83,8 +78,6 @@ def register_or_update_user(username: str, user_id: int = None, amount: float = 
         else:
             new_volume = user[2] + amount
             new_orders_count = user[3] + (1 if amount > 0 else 0)
-            
-            # Вычисляем новый тег с учетом текущего
             new_tag = calculate_tag(new_volume, user[4])
             
             cur.execute("UPDATE users SET total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
@@ -124,6 +117,10 @@ async def process_order(message: types.Message):
     buyer_username = match.group(2).lower()
     seller_username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
 
+    # Сначала фиксируем старое количество ордеров покупателя до обновления
+    buyer_old_data = get_user(buyer_username)
+    buyer_old_orders = buyer_old_data[3] if buyer_old_data else 0
+
     register_or_update_user(seller_username, message.from_user.id, amount)
     register_or_update_user(buyer_username, None, amount)
 
@@ -145,9 +142,16 @@ async def process_order(message: types.Message):
     )
     await message.answer(receipt_text, parse_mode="HTML")
 
-    if buyer_data[3] == 3 and buyer_data[0]:
+    # Проверка: если после этого ордера у покупателя стало ровно 3 ордера (было 2, стало 3)
+    if buyer_old_orders == 2 and buyer_data[3] == 3 and buyer_data[0]:
         try:
-            await bot.send_message(chat_id=buyer_data[0], text=f"🎉 Вы закрыли 3 ордера! Наш основной чат: {MAIN_CHAT_LINK}")
+            welcome_text = (
+                "🟢<b>Добро пожаловать UNION ORDERS!</b>🟢\n\n"
+                "Вы успешно закрыли 3 ордера и теперь получаете доступ в основной чат:\n"
+                f"{MAIN_CHAT_LINK}\n"
+                "Хороших профитов!"
+            )
+            await bot.send_message(chat_id=buyer_data[0], text=welcome_text, parse_mode="HTML")
         except TelegramAPIError:
             pass
 
@@ -176,7 +180,6 @@ async def cmd_tag(message: types.Message, command: CommandObject):
     if not user:
         return await message.answer("❌ У вас пока нет профиля в базе. Совершите или закройте хотя бы один ордер.")
     
-    # Проверка на достижение 10,000$ оборота
     if user[2] < 10000:
         return await message.answer(f"🔒 Кастомный тег доступен при общем обороте от <b>10,000$</b>.\nВаш текущий оборот: <b>{user[2]}$</b>", parse_mode="HTML")
     
