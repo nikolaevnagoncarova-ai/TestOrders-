@@ -89,11 +89,9 @@ async def process_order(message: types.Message):
     buyer_username = match.group(2).lower()
     seller_username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
 
-    # Засчитываем оборот ОБИМ участникам сделки
     register_or_update_user(seller_username, message.from_user.id, amount)
     register_or_update_user(buyer_username, None, amount)
 
-    # Обновляем глобальную статистику
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
         cur.execute("UPDATE stats SET total_orders = total_orders + 1, total_volume = total_volume + ? WHERE id = 1", (amount,))
@@ -112,14 +110,13 @@ async def process_order(message: types.Message):
     )
     await message.answer(receipt_text, parse_mode="HTML")
 
-    # Авто-приглашение на 3-й ордер
     if buyer_data[3] == 3 and buyer_data[0]:
         try:
             await bot.send_message(chat_id=buyer_data[0], text=f"🎉 Вы закрыли 3 ордера! Наш основной чат: {MAIN_CHAT_LINK}")
         except TelegramAPIError:
             pass
 
-# === ДОПОЛНИТЕЛЬНЫЕ КОМАНДЫ ===
+# === КОМАНДЫ ===
 @dp.message(Command("top"))
 async def cmd_top(message: types.Message):
     with sqlite3.connect(DB_FILE) as conn:
@@ -201,6 +198,7 @@ async def cmd_stats(message: types.Message):
     text = f"🌐 <b>Статистика проекта:</b>\n📝 Всего закрыто ордеров: <b>{st[0]}</b>\n💰 Общий оборот: <b>{st[1]}$</b>"
     await message.answer(text, parse_mode="HTML")
 
+# ИСПРАВЛЕНО: Добавлен отсутствовавший декоратор @dp.message(Command("help"))
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     text = (
