@@ -3,7 +3,6 @@ import re
 import sqlite3
 import asyncio
 import logging
-import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
@@ -18,9 +17,6 @@ DB_FILE = "p2p_orders.db"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-
-# Кэш для защиты от двойного срабатывания сообщений
-last_processed_messages = {}
 
 # === БАЗА ДАННЫХ ===
 def init_db():
@@ -40,6 +36,14 @@ def init_db():
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 total_orders INTEGER DEFAULT 0,
                 total_volume REAL DEFAULT 0.0
+            )
+        """)
+        # Таблица для защиты от обработки одного и того же сообщения дважды
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                chat_id INTEGER,
+                message_id INTEGER,
+                PRIMARY KEY (chat_id, message_id)
             )
         """)
         cursor.execute("INSERT OR IGNORE INTO stats (id) VALUES (1)")
@@ -115,12 +119,15 @@ ORDER_REGEX = re.compile(r"^\+\s*(\d+(?:\.\d+)?)\$?\s*@([a-zA-Z0-9_]+)")
 
 @dp.message(F.text.regexp(ORDER_REGEX))
 async def process_order(message: types.Message):
-    # Защита от дублей сообщений (если текст и чат те же самые в течение 2 секунд)
-    msg_key = (message.chat.id, message.text)
-    current_time = time.time()
-    if msg_key in last_processed_messages and current_time - last_processed_messages[msg_key] < 2.0:
-        return
-    last_processed_messages[msg_key] = current_time
+    # Строгая защита в БД: если это конкретное сообщение уже обрабатывалось, сразу выходим
+    with sqlite3.connect(DB_FILE) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("INSERT INTO processed_messages (chat_id, message_id) VALUES (?, ?)", (message.chat.id, message.message_id))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            # Сообщение уже было обработано другим потоком/экземпляром бота
+            return
 
     match = ORDER_REGEX.match(message.text)
     amount = float(match.group(1))
@@ -151,7 +158,7 @@ async def process_order(message: types.Message):
     )
     await message.answer(receipt_text, parse_mode="HTML")
 
-    # Отправка приглашения, если ровно достигли 3 ордеров (переход с 2 на 3)
+    # Отправка приглашения при переходе на 3-й ордер
     if buyer_old_orders < 3 and buyer_data[3] >= 3 and buyer_data[0]:
         try:
             welcome_text = (
