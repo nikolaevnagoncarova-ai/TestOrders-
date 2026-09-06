@@ -148,6 +148,17 @@ ORDER_REGEX = re.compile(r"^\+\s*(\d+(?:\.\d+)?)\$?\s*@([a-zA-Z0-9_]+)")
 
 @dp.message(F.text.regexp(ORDER_REGEX))
 async def process_order(message: types.Message):
+    # ПРОТЕКЦИЯ: Проверяем, является ли отправитель админом в группе
+    if message.chat.type in ['group', 'supergroup']:
+        try:
+            member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+            if member.status not in ['administrator', 'creator']:
+                await message.reply("❌ <b>Отказано:</b> закрывать ордера могут только администраторы.", parse_mode="HTML")
+                return # Прерываем выполнение, если это не админ
+        except TelegramAPIError:
+            pass # Если бот не смог проверить права, идем дальше, но обычно проблем не бывает
+
+    # Проверка на дубликаты сообщений (защита от спама)
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
         try:
