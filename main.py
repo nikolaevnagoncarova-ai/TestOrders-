@@ -74,7 +74,6 @@ async def update_user_admin_title(chat_id: int, user_id: int, tag: str):
     if not user_id:
         return
     try:
-        # 1. Назначаем пользователя администратором (минимальные права, чтобы чат не ломать)
         await bot.promote_chat_member(
             chat_id=chat_id,
             user_id=user_id,
@@ -90,14 +89,13 @@ async def update_user_admin_title(chat_id: int, user_id: int, tag: str):
             can_edit_messages=False,
             can_pin_messages=False
         )
-        # 2. Устанавливаем серый префикс (максимум 16 символов в Telegram)
         await bot.set_chat_administrator_custom_title(
             chat_id=chat_id,
             user_id=user_id,
             custom_title=tag[:16]
         )
     except Exception as e:
-        print(f"Не удалось выдать префикс админа: {e}")
+        logging.error(f"Не удалось выдать префикс админа: {e}")
 
 def register_or_update_user(username: str, user_id: int = None, amount: float = 0.0):
     clean_username = username.replace("@", "").lower()
@@ -186,12 +184,10 @@ async def process_order(message: types.Message):
     )
     await message.answer(receipt_text, parse_mode="HTML")
 
-    # Автоматически обновляем префикс/админку в группе, если тег изменился или появился user_id
     if buyer_data[0]:
         if buyer_old_tag != buyer_data[4] or buyer_old_orders == 0:
             await update_user_admin_title(message.chat.id, buyer_data[0], buyer_data[4])
 
-    # Отправка приглашения в ЛС при переходе на 3-й ордер
     if buyer_old_orders < 3 and buyer_data[3] >= 3 and buyer_data[0]:
         try:
             welcome_text = (
@@ -243,7 +239,6 @@ async def cmd_tag(message: types.Message, command: CommandObject):
         conn.execute("UPDATE users SET tag = ? WHERE username = ?", (new_tag, username))
         conn.commit()
 
-    # Сразу обновляем префикс в группе
     if user[0]:
         await update_user_admin_title(message.chat.id, user[0], new_tag)
 
@@ -339,7 +334,7 @@ async def main():
     init_db()
     await set_bot_commands(bot)
     await bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.gather(start_web_server(), dp.start_polling(bot, handle_as_tasks=True))
+    await asyncio.gather(start_web_server(), dp.start_polling(bot))
 
 if __name__ == "__main__":
     asyncio.run(main())
