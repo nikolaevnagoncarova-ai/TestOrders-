@@ -3,6 +3,7 @@ import re
 import sqlite3
 import asyncio
 import logging
+import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
@@ -17,6 +18,9 @@ DB_FILE = "p2p_orders.db"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Кэш для защиты от двойного срабатывания сообщений
+last_processed_messages = {}
 
 # === БАЗА ДАННЫХ ===
 def init_db():
@@ -41,7 +45,6 @@ def init_db():
         cursor.execute("INSERT OR IGNORE INTO stats (id) VALUES (1)")
         conn.commit()
 
-# Функция автоматического определения тега по обороту
 def calculate_tag(current_volume: float, existing_tag: str) -> str:
     if current_volume >= 10000:
         standard_tags = ['Пользователь', 'Buyer', 'Big buyer', 'Premium buyer', 'Elite buyer', 'Vip buyer', 'Legend buyer']
@@ -112,12 +115,18 @@ ORDER_REGEX = re.compile(r"^\+\s*(\d+(?:\.\d+)?)\$?\s*@([a-zA-Z0-9_]+)")
 
 @dp.message(F.text.regexp(ORDER_REGEX))
 async def process_order(message: types.Message):
+    # Защита от дублей сообщений (если текст и чат те же самые в течение 2 секунд)
+    msg_key = (message.chat.id, message.text)
+    current_time = time.time()
+    if msg_key in last_processed_messages and current_time - last_processed_messages[msg_key] < 2.0:
+        return
+    last_processed_messages[msg_key] = current_time
+
     match = ORDER_REGEX.match(message.text)
     amount = float(match.group(1))
     buyer_username = match.group(2).lower()
     seller_username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
 
-    # Сначала фиксируем старое количество ордеров покупателя до обновления
     buyer_old_data = get_user(buyer_username)
     buyer_old_orders = buyer_old_data[3] if buyer_old_data else 0
 
@@ -142,8 +151,8 @@ async def process_order(message: types.Message):
     )
     await message.answer(receipt_text, parse_mode="HTML")
 
-    # Проверка: если после этого ордера у покупателя стало ровно 3 ордера (было 2, стало 3)
-    if buyer_old_orders == 2 and buyer_data[3] == 3 and buyer_data[0]:
+    # Отправка приглашения, если ровно достигли 3 ордеров (переход с 2 на 3)
+    if buyer_old_orders < 3 and buyer_data[3] >= 3 and buyer_data[0]:
         try:
             welcome_text = (
                 "🟢<b>Добро пожаловать UNION ORDERS!</b>🟢\n\n"
