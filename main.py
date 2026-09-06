@@ -69,10 +69,11 @@ def calculate_tag(current_volume: float, existing_tag: str) -> str:
     else:
         return 'Пользователь'
 
-# Функция автоматической выдачи админки и изменения серого префикса
-async def update_user_admin_title(chat_id: int, user_id: int, tag: str):
+# Умная функция выдачи админки и префикса
+async def update_user_admin_title(chat_id: int, user_id: int, tag: str, username: str):
     if not user_id:
-        return
+        return False, "NO_ID"
+
     try:
         await bot.promote_chat_member(
             chat_id=chat_id,
@@ -94,8 +95,9 @@ async def update_user_admin_title(chat_id: int, user_id: int, tag: str):
             user_id=user_id,
             custom_title=tag[:16]
         )
-    except Exception as e:
-        logging.error(f"Не удалось выдать префикс админа: {e}")
+        return True, "OK"
+    except TelegramAPIError as e:
+        return False, e.message
 
 def register_or_update_user(username: str, user_id: int = None, amount: float = 0.0):
     clean_username = username.replace("@", "").lower()
@@ -184,10 +186,17 @@ async def process_order(message: types.Message):
     )
     await message.answer(receipt_text, parse_mode="HTML")
 
-    if buyer_data[0]:
-        if buyer_old_tag != buyer_data[4] or buyer_old_orders == 0:
-            await update_user_admin_title(message.chat.id, buyer_data[0], buyer_data[4])
+    # Умная выдача тега с уведомлениями
+    if buyer_old_tag != buyer_data[4] or buyer_old_orders == 0:
+        if buyer_data[0]: 
+            success, msg = await update_user_admin_title(message.chat.id, buyer_data[0], buyer_data[4], buyer_username)
+            if not success:
+                if "not enough rights" in msg.lower() or "administrator" in msg.lower() or "creator" in msg.lower():
+                    await message.answer(f"⚠️ Не могу выдать тег @{buyer_username}. Возможно, он создатель чата, либо уже назначен админом вручную.")
+        else: 
+            await message.answer(f"⚠️ @{buyer_username}, тебе присвоен новый ранг <b>{buyer_data[4]}</b>! Но я не могу выдать префикс, так как не знаю твой ID.\n\n👉 <b>Напиши любое слово в этот чат</b>, чтобы я тебя запомнил и выдал тег.", parse_mode="HTML")
 
+    # Отправка приглашения в ЛС при переходе на 3-й ордер
     if buyer_old_orders < 3 and buyer_data[3] >= 3 and buyer_data[0]:
         try:
             welcome_text = (
@@ -240,7 +249,7 @@ async def cmd_tag(message: types.Message, command: CommandObject):
         conn.commit()
 
     if user[0]:
-        await update_user_admin_title(message.chat.id, user[0], new_tag)
+        await update_user_admin_title(message.chat.id, user[0], new_tag, username)
 
     await message.answer(f"✅ Ваш персональный префикс успешно изменен на: <b>{new_tag}</b>", parse_mode="HTML")
 
@@ -312,10 +321,21 @@ async def cmd_help(message: types.Message):
     )
     await message.answer(text, parse_mode="HTML")
 
+# Умный перехват сообщений для привязки ID и выдачи тега
 @dp.message()
 async def track_all_users(message: types.Message):
     if message.from_user and message.from_user.username:
-        register_or_update_user(message.from_user.username, message.from_user.id, 0)
+        username = message.from_user.username.lower()
+        user_id = message.from_user.id
+        
+        user = get_user(username)
+        if user:
+            if not user[0]: # Если юзер был в базе, но без ID
+                register_or_update_user(username, user_id, 0)
+                # Выдаем тег мгновенно!
+                await update_user_admin_title(message.chat.id, user_id, user[4], username)
+        else:
+            register_or_update_user(username, user_id, 0)
 
 # === SERVER & START ===
 async def handle_ping(request):
