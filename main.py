@@ -161,17 +161,16 @@ async def process_order(message: types.Message):
     amount = float(match.group(1))
     buyer_username = match.group(2).lower()
     
+    # Сохраняем/обновляем ID отправителя (селлера/админа), НО НЕ добавляем ему оборот (amount = 0.0)
     if message.from_user:
-        register_or_update_user(
-            message.from_user.username if message.from_user.username else f"id{message.from_user.id}", 
-            message.from_user.id, 
-            amount
-        )
+        admin_username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
+        register_or_update_user(admin_username, message.from_user.id, 0.0)
 
     buyer_old_data = get_user(buyer_username)
     buyer_old_orders = buyer_old_data[3] if buyer_old_data else 0
     buyer_old_tag = buyer_old_data[4] if buyer_old_data else 'Пользователь'
 
+    # Начисляем оборот ИСКЛЮЧИТЕЛЬНО скупщику
     register_or_update_user(buyer_username, None, amount)
 
     with sqlite3.connect(DB_FILE) as conn:
@@ -214,7 +213,8 @@ async def process_order(message: types.Message):
 async def cmd_top(message: types.Message):
     with sqlite3.connect(DB_FILE) as conn:
         cur = conn.cursor()
-        cur.execute("SELECT username, total_volume, orders_count, tag FROM users ORDER BY total_volume DESC LIMIT 10")
+        # Показываем только тех, у кого оборот больше 0 (т.е. реальных скупщиков)
+        cur.execute("SELECT username, total_volume, orders_count, tag FROM users WHERE total_volume > 0 ORDER BY total_volume DESC LIMIT 10")
         leaders = cur.fetchall()
 
     if not leaders:
