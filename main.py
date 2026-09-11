@@ -1,8 +1,8 @@
 import os
 import re
-import sqlite3
 import asyncio
 import logging
+import libsql_client
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandObject
@@ -13,16 +13,24 @@ from aiogram.exceptions import TelegramAPIError
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MAIN_CHAT_LINK = "https://t.me/+q1ipzXuMbYczMDBi"
 PORT = int(os.getenv("PORT", 8080))
-DB_FILE = "p2p_orders.db"
+
+# Параметры подключения к Turso из Environment Variables
+TURSO_URL = os.getenv("TURSO_DATABASE_URL")
+TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+def get_db():
+    return libsql_client.create_client_sync(
+        url=TURSO_URL,
+        auth_token=TURSO_TOKEN
+    )
+
 # === БАЗА ДАННЫХ ===
 def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+    with get_db() as client:
+        client.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT UNIQUE,
@@ -31,22 +39,21 @@ def init_db():
                 orders_count INTEGER DEFAULT 0
             )
         """)
-        cursor.execute("""
+        client.execute("""
             CREATE TABLE IF NOT EXISTS stats (
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 total_orders INTEGER DEFAULT 0,
                 total_volume REAL DEFAULT 0.0
             )
         """)
-        cursor.execute("""
+        client.execute("""
             CREATE TABLE IF NOT EXISTS processed_messages (
                 chat_id INTEGER,
                 message_id INTEGER,
                 PRIMARY KEY (chat_id, message_id)
             )
         """)
-        cursor.execute("INSERT OR IGNORE INTO stats (id) VALUES (1)")
-        conn.commit()
+        client.execute("INSERT OR IGNORE INTO stats (id) VALUES (1)")
 
 def calculate_tag(current_volume: float, existing_tag: str) -> str:
     if current_volume >= 10000:
@@ -92,15 +99,14 @@ async def update_user_member_tag(chat_id: int, username: str, tag: str):
 
 def register_or_update_user(username: str, user_id: int = None, amount: float = 0.0):
     clean_username = username.replace("@", "").lower()
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, username, total_volume, orders_count, tag FROM users WHERE username = ?", (clean_username,))
-        user = cur.fetchone()
+    with get_db() as client:
+        rs = client.execute("SELECT user_id, username, total_volume, orders_count, tag FROM users WHERE username = ?", (clean_username,))
+        user = rs.rows[0] if len(rs.rows) > 0 else None
         
         if not user:
             new_volume = amount
             new_tag = calculate_tag(new_volume, 'Пользователь')
-            cur.execute("INSERT INTO users (user_id, username, total_volume, orders_count, tag) VALUES (?, ?, ?, ?, ?)",
+            client.execute("INSERT INTO users (user_id, username, total_volume, orders_count, tag) VALUES (?, ?, ?, ?, ?)",
                         (user_id, clean_username, new_volume, 1 if amount > 0 else 0, new_tag))
         else:
             new_volume = user[2] + amount
@@ -108,17 +114,14 @@ def register_or_update_user(username: str, user_id: int = None, amount: float = 
             new_tag = calculate_tag(new_volume, user[4])
             
             final_user_id = user_id if user_id else user[0]
-            cur.execute("UPDATE users SET user_id = ?, total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
+            client.execute("UPDATE users SET user_id = ?, total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
                         (final_user_id, new_volume, new_orders_count, new_tag, clean_username))
-                
-        conn.commit()
 
 def get_user(username: str):
     clean_username = username.replace("@", "").lower()
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, username, total_volume, orders_count, tag FROM users WHERE username = ?", (clean_username,))
-        return cur.fetchone()
+    with get_db() as client:
+        rs = client.execute("SELECT user_id, username, total_volume, orders_count, tag FROM users WHERE username = ?", (clean_username,))
+        return rs.rows[0] if len(rs.rows) > 0 else None
 
 # === КОМАНДЫ МЕНЮ ===
 async def set_bot_commands(bot: Bot):
@@ -149,19 +152,16 @@ async def process_order(message: types.Message):
             await message.reply(f"❌ <b>Ошибка проверки прав:</b> <code>{e}</code>", parse_mode="HTML")
             return
 
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
+    with get_db() as client:
         try:
-            cur.execute("INSERT INTO processed_messages (chat_id, message_id) VALUES (?, ?)", (message.chat.id, message.message_id))
-            conn.commit()
-        except sqlite3.IntegrityError:
+            client.execute("INSERT INTO processed_messages (chat_id, message_id) VALUES (?, ?)", (message.chat.id, message.message_id))
+        except Exception:
             return
 
     match = ORDER_REGEX.match(message.text)
     amount = float(match.group(1))
     buyer_username = match.group(2).lower()
     
-    # Сохраняем/обновляем ID отправителя (селлера/админа), НО НЕ добавляем ему оборот (amount = 0.0)
     if message.from_user:
         admin_username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
         register_or_update_user(admin_username, message.from_user.id, 0.0)
@@ -170,15 +170,12 @@ async def process_order(message: types.Message):
     buyer_old_orders = buyer_old_data[3] if buyer_old_data else 0
     buyer_old_tag = buyer_old_data[4] if buyer_old_data else 'Пользователь'
 
-    # Начисляем оборот ИСКЛЮЧИТЕЛЬНО скупщику
     register_or_update_user(buyer_username, None, amount)
 
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE stats SET total_orders = total_orders + 1, total_volume = total_volume + ? WHERE id = 1", (amount,))
-        cur.execute("SELECT total_orders FROM stats WHERE id = 1")
-        global_order_id = cur.fetchone()[0]
-        conn.commit()
+    with get_db() as client:
+        client.execute("UPDATE stats SET total_orders = total_orders + 1, total_volume = total_volume + ? WHERE id = 1", (amount,))
+        rs = client.execute("SELECT total_orders FROM stats WHERE id = 1")
+        global_order_id = rs.rows[0][0]
 
     buyer_data = get_user(buyer_username)
 
@@ -211,11 +208,9 @@ async def process_order(message: types.Message):
 # === КОМАНДЫ ===
 @dp.message(Command("top"))
 async def cmd_top(message: types.Message):
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        # Показываем только тех, у кого оборот больше 0 (т.е. реальных скупщиков)
-        cur.execute("SELECT username, total_volume, orders_count, tag FROM users WHERE total_volume > 0 ORDER BY total_volume DESC LIMIT 10")
-        leaders = cur.fetchall()
+    with get_db() as client:
+        rs = client.execute("SELECT username, total_volume, orders_count, tag FROM users WHERE total_volume > 0 ORDER BY total_volume DESC LIMIT 10")
+        leaders = rs.rows
 
     if not leaders:
         return await message.answer("🏆 Рейтинг пока пуст.")
@@ -246,9 +241,8 @@ async def cmd_tag(message: types.Message, command: CommandObject):
     if len(new_tag) > 16:
         return await message.answer("❌ Префикс слишком длинный. Максимум 16 символов для Telegram.")
     
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.execute("UPDATE users SET tag = ? WHERE username = ?", (new_tag, username))
-        conn.commit()
+    with get_db() as client:
+        client.execute("UPDATE users SET tag = ? WHERE username = ?", (new_tag, username))
 
     success, msg = await update_user_member_tag(message.chat.id, username, new_tag)
     if not success:
@@ -293,10 +287,9 @@ async def cmd_info(message: types.Message, command: CommandObject):
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
-    with sqlite3.connect(DB_FILE) as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT total_orders, total_volume FROM stats WHERE id = 1")
-        st = cur.fetchone()
+    with get_db() as client:
+        rs = client.execute("SELECT total_orders, total_volume FROM stats WHERE id = 1")
+        st = rs.rows[0]
         
     text = f"🌐 <b>Статистика проекта:</b>\n📝 Всего закрыто ордеров: <b>{st[0]}</b>\n💰 Общий оборот: <b>{st[1]}$</b>"
     await message.answer(text, parse_mode="HTML")
