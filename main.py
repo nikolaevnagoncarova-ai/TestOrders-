@@ -100,22 +100,39 @@ async def update_user_member_tag(chat_id: int, username: str, tag: str):
 def register_or_update_user(username: str, user_id: int = None, amount: float = 0.0):
     clean_username = username.replace("@", "").lower()
     with get_db() as client:
+        # 1. Сначала ищем по неизменному user_id, чтобы отследить смену юзернейма
+        if user_id:
+            rs = client.execute("SELECT user_id, username, total_volume, orders_count, tag FROM users WHERE user_id = ?", (user_id,))
+            if len(rs.rows) > 0:
+                user = rs.rows[0]
+                new_volume = user[2] + amount
+                new_orders = user[3] + (1 if amount > 0 else 0)
+                new_tag = calculate_tag(new_volume, user[4])
+                
+                # Обновляем юзернейм на новый, если он сменился, и сохраняем статистику
+                client.execute("UPDATE users SET username = ?, total_volume = ?, orders_count = ?, tag = ? WHERE user_id = ?",
+                            (clean_username, new_volume, new_orders, new_tag, user_id))
+                return
+
+        # 2. Если user_id нет (поиск по тексту ордера) или юзер полностью новый
         rs = client.execute("SELECT user_id, username, total_volume, orders_count, tag FROM users WHERE username = ?", (clean_username,))
-        user = rs.rows[0] if len(rs.rows) > 0 else None
         
-        if not user:
+        if len(rs.rows) > 0:
+            user = rs.rows[0]
+            new_volume = user[2] + amount
+            new_orders = user[3] + (1 if amount > 0 else 0)
+            new_tag = calculate_tag(new_volume, user[4])
+            
+            # Если изначально ID не было, а теперь появился - сохраняем его
+            final_user_id = user_id if user_id else user[0]
+            client.execute("UPDATE users SET user_id = ?, total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
+                        (final_user_id, new_volume, new_orders, new_tag, clean_username))
+        else:
+            # 3. Полностью новый пользователь
             new_volume = amount
             new_tag = calculate_tag(new_volume, 'Пользователь')
             client.execute("INSERT INTO users (user_id, username, total_volume, orders_count, tag) VALUES (?, ?, ?, ?, ?)",
                         (user_id, clean_username, new_volume, 1 if amount > 0 else 0, new_tag))
-        else:
-            new_volume = user[2] + amount
-            new_orders_count = user[3] + (1 if amount > 0 else 0)
-            new_tag = calculate_tag(new_volume, user[4])
-            
-            final_user_id = user_id if user_id else user[0]
-            client.execute("UPDATE users SET user_id = ?, total_volume = ?, orders_count = ?, tag = ? WHERE username = ?",
-                        (final_user_id, new_volume, new_orders_count, new_tag, clean_username))
 
 def get_user(username: str):
     clean_username = username.replace("@", "").lower()
@@ -164,6 +181,7 @@ async def process_order(message: types.Message):
     
     if message.from_user:
         admin_username = message.from_user.username.lower() if message.from_user.username else f"id{message.from_user.id}"
+        # Регистрация отправителя сразу синхронизирует его новый ник, если он был изменен
         register_or_update_user(admin_username, message.from_user.id, 0.0)
 
     buyer_old_data = get_user(buyer_username)
@@ -320,7 +338,11 @@ async def track_all_users(message: types.Message):
     if message.from_user and message.from_user.username:
         username = message.from_user.username.lower()
         user_id = message.from_user.id
-        register_or_update_user(username, user_id, 0)
+        # Оборачиваем в try-except для безопасности фонового отслеживания
+        try:
+            register_or_update_user(username, user_id, 0)
+        except Exception:
+            pass
 
 # === SERVER & START ===
 async def handle_ping(request):
